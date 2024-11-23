@@ -22,6 +22,9 @@ Library integrated and maintained by Paul Sokolovsky.
 
 uzlib library is licensed under Zlib license.
 
+This version is optimized for RP2xxx, using the interpolator for bit unpacking,
+plus several other optimizations.  Changes (c) Michael Bell 2024.
+
 
 Decompressor features
 ---------------------

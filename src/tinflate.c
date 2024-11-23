@@ -35,6 +35,8 @@
 #include <assert.h>
 #include <string.h>
 #include "tinf.h"
+#include "hardware/interp.h"
+#include <stdio.h>
 
 #define UZLIB_DUMP_ARRAY(heading, arr, size) \
     { \
@@ -128,11 +130,18 @@ static void tinf_build_fixed_trees(TINF_TREE *lt, TINF_TREE *dt)
    int i;
 
    /* build fixed length tree */
-   for (i = 0; i < 7; ++i) lt->table[i] = 0;
+   for (i = 0; i < 7; ++i) {
+      lt->table[i] = 0;
+      lt->offs[i] = 0;
+   }
 
+   lt->offs[7] = 0;
    lt->table[7] = 24;
+   lt->offs[8] = 24;
    lt->table[8] = 152;
+   lt->offs[9] = 24 + 152;
    lt->table[9] = 112;
+   lt->offs[10] = 24 + 152 + 112;
 
    for (i = 0; i < 24; ++i) lt->trans[i] = 256 + i;
    for (i = 0; i < 144; ++i) lt->trans[24 + i] = i;
@@ -140,9 +149,14 @@ static void tinf_build_fixed_trees(TINF_TREE *lt, TINF_TREE *dt)
    for (i = 0; i < 112; ++i) lt->trans[24 + 144 + 8 + i] = 144 + i;
 
    /* build fixed distance tree */
-   for (i = 0; i < 5; ++i) dt->table[i] = 0;
+   for (i = 0; i < 5; ++i) {
+      dt->table[i] = 0;
+      dt->offs[i] = 0;
+   }
 
+   dt->offs[5] = 0;
    dt->table[5] = 32;
+   dt->offs[6] = 32;
 
    for (i = 0; i < 32; ++i) dt->trans[i] = i;
 }
@@ -150,7 +164,6 @@ static void tinf_build_fixed_trees(TINF_TREE *lt, TINF_TREE *dt)
 /* given an array of code lengths, build a tree */
 static void tinf_build_tree(TINF_TREE *t, const unsigned char *lengths, unsigned int num)
 {
-   unsigned short offs[16];
    unsigned int i, sum;
 
    /* clear code length count table */
@@ -171,7 +184,7 @@ static void tinf_build_tree(TINF_TREE *t, const unsigned char *lengths, unsigned
    /* compute offset table for distribution sort */
    for (sum = 0, i = 0; i < 16; ++i)
    {
-      offs[i] = sum;
+      t->offs[i] = sum;
       sum += t->table[i];
    }
 
@@ -182,7 +195,7 @@ static void tinf_build_tree(TINF_TREE *t, const unsigned char *lengths, unsigned
    /* create code->symbol translation table (symbols sorted by code) */
    for (i = 0; i < num; ++i)
    {
-      if (lengths[i]) t->trans[offs[lengths[i]]++] = i;
+      if (lengths[i]) t->trans[t->offs[lengths[i]]++] = i;
    }
 }
 
@@ -245,13 +258,12 @@ static int tinf_getbit(TINF_DATA *d)
    if (!d->bitcount--)
    {
       /* load next tag */
-      d->tag = uzlib_get_byte(d);
+      interp0->accum[0] = uzlib_get_byte(d);
       d->bitcount = 7;
    }
 
    /* shift bit out of tag */
-   bit = d->tag & 0x01;
-   d->tag >>= 1;
+   bit = interp0->pop[1];
 
    return bit;
 }
@@ -264,11 +276,32 @@ static unsigned int tinf_read_bits(TINF_DATA *d, int num, int base)
    /* read num bits */
    if (num)
    {
-      unsigned int limit = 1 << (num);
-      unsigned int mask;
+      if (num > d->bitcount) {
+         unsigned int shift = d->bitcount;
+         val = interp0->accum[0];
 
-      for (mask = 1; mask < limit; mask *= 2)
-         if (tinf_getbit(d)) val += mask;
+         while (shift + 8 <= num) {
+            val |= uzlib_get_byte(d) << shift;
+            shift += 8;
+         }
+
+         if (shift < num) {
+            unsigned int next_byte = uzlib_get_byte(d);
+            unsigned int mask = (1 << num) - (1 << shift);
+            val |= (next_byte << shift) & mask;
+            d->bitcount = 8 - (num - shift);
+            interp0->accum[0] = next_byte >> (num - shift);
+         } else {
+            d->bitcount = 0;
+            interp0->accum[0] = 0;
+         }
+      } else {
+         unsigned int mask = (1 << num) - 1;
+         unsigned int tag = interp0->accum[0];
+         val = tag & mask;
+         interp0->accum[0] = tag >> num;
+         d->bitcount -= num;
+      }
    }
 
    return val + base;
@@ -277,23 +310,24 @@ static unsigned int tinf_read_bits(TINF_DATA *d, int num, int base)
 /* given a data stream and a tree, decode a symbol */
 static int tinf_decode_symbol(TINF_DATA *d, TINF_TREE *t)
 {
-   int sum = 0, cur = 0, len = 0;
+   int sum, cur = 0, len = 0;
 
    /* get more bits while code value is above sum */
    do {
 
-      cur = 2*cur + tinf_getbit(d);
+      cur = (cur << 1) + tinf_getbit(d);
 
-      if (++len == TINF_ARRAY_SIZE(t->table)) {
+      #if UZLIB_CONF_PARANOID_CHECKS
+      if (len+1 == TINF_ARRAY_SIZE(t->table)) {
          return TINF_DATA_ERROR;
       }
+      #endif
 
-      sum += t->table[len];
-      cur -= t->table[len];
+      cur -= t->table[++len];
 
    } while (cur >= 0);
 
-   sum += cur;
+   sum = cur + t->offs[len];
    #if UZLIB_CONF_PARANOID_CHECKS
    if (sum < 0 || sum >= TINF_ARRAY_SIZE(t->trans)) {
       return TINF_DATA_ERROR;
@@ -406,96 +440,70 @@ static int tinf_decode_trees(TINF_DATA *d, TINF_TREE *lt, TINF_TREE *dt)
 /* given a stream and two trees, inflate next chunk of output (a byte or more) */
 static int tinf_inflate_block_data(TINF_DATA *d, TINF_TREE *lt, TINF_TREE *dt)
 {
-    if (d->curlen == 0) {
-        unsigned int offs;
-        int dist;
-        int sym = tinf_decode_symbol(d, lt);
-        //printf("huff sym: %02x\n", sym);
+   if (d->curlen == 0) {
+      int offs;
+      int dist;
+      int sym = tinf_decode_symbol(d, lt);
+      //printf("huff sym: %02x\n", sym);
 
-        if (d->eof) {
-            return TINF_DATA_ERROR;
-        }
+      if (d->eof) {
+         return TINF_DATA_ERROR;
+      }
 
-        /* literal byte */
-        if (sym < 256) {
-            TINF_PUT(d, sym);
-            return TINF_OK;
-        }
+      /* literal byte */
+      if (sym < 256) {
+         TINF_PUT(d, sym);
+         return TINF_OK;
+      }
 
-        /* end of block */
-        if (sym == 256) {
-            return TINF_DONE;
-        }
+      /* end of block */
+      if (sym == 256) {
+         return TINF_DONE;
+      }
 
-        /* substring from sliding dictionary */
-        sym -= 257;
-        if (sym >= 29) {
-            return TINF_DATA_ERROR;
-        }
+      /* substring from sliding dictionary */
+      sym -= 257;
+      if (sym >= 29) {
+         return TINF_DATA_ERROR;
+      }
 
-        /* possibly get more bits from length code */
-        d->curlen = tinf_read_bits(d, length_bits[sym], length_base[sym]);
+      /* possibly get more bits from length code */
+      d->curlen = tinf_read_bits(d, length_bits[sym], length_base[sym]);
 
-        dist = tinf_decode_symbol(d, dt);
-        if (dist >= 30) {
-            return TINF_DATA_ERROR;
-        }
+      dist = tinf_decode_symbol(d, dt);
+      if (dist >= 30) {
+         return TINF_DATA_ERROR;
+      }
 
-        /* possibly get more bits from distance code */
-        offs = tinf_read_bits(d, dist_bits[dist], dist_base[dist]);
+      /* possibly get more bits from distance code */
+      offs = tinf_read_bits(d, dist_bits[dist], dist_base[dist]);
 
-        /* calculate and validate actual LZ offset to use */
-        if (d->dict_ring) {
-            if (offs > d->dict_size) {
-                return TINF_DICT_ERROR;
-            }
-            /* Note: unlike full-dest-in-memory case below, we don't
-               try to catch offset which points to not yet filled
-               part of the dictionary here. Doing so would require
-               keeping another variable to track "filled in" size
-               of the dictionary. Appearance of such an offset cannot
-               lead to accessing memory outside of the dictionary
-               buffer, and clients which don't want to leak unrelated
-               information, should explicitly initialize dictionary
-               buffer passed to uzlib. */
+      /* calculate and validate actual LZ offset to use */
+      /* catch trying to point before the start of dest buffer */
+      if (offs > d->dest - d->dest_ring_start) {
+         offs -= d->dest_ring_end - d->dest_ring_start;
+         if (offs > 0) {
+            printf("offs: %d", offs + d->dest_ring_end - d->dest_ring_start);
+            return TINF_DICT_ERROR;
+         }
+      }
+      d->lzPtr = d->dest - offs;
+   }
 
-            d->lzOff = d->dict_idx - offs;
-            if (d->lzOff < 0) {
-                d->lzOff += d->dict_size;
-            }
-        } else {
-            /* catch trying to point before the start of dest buffer */
-            if (offs > d->dest - d->destStart) {
-                return TINF_DATA_ERROR;
-            }
-            d->lzOff = -offs;
-        }
-    }
+   {
+      /* copy next byte from dict substring */
+      unsigned int to_copy = d->curlen, dest_len = d->dest_limit - d->dest;
+      if (to_copy > dest_len) {
+         to_copy = dest_len;
+      }
+      d->curlen -= to_copy;
+      while (to_copy--) {
+         *d->dest++ = *d->lzPtr++;
+         if (d->lzPtr == d->dest_ring_end) d->lzPtr = d->dest_ring_start;
+      }
+   }
 
-    /* copy next byte from dict substring */
-    if (d->dict_ring) {
-        TINF_PUT(d, d->dict_ring[d->lzOff]);
-        if ((unsigned)++d->lzOff == d->dict_size) {
-            d->lzOff = 0;
-        }
-    } else {
-        #if UZLIB_CONF_USE_MEMCPY
-        /* copy as much as possible, in one memcpy() call */
-        unsigned int to_copy = d->curlen, dest_len = d->dest_limit - d->dest;
-        if (to_copy > dest_len) {
-            to_copy = dest_len;
-        }
-        memcpy(d->dest, d->dest + d->lzOff, to_copy);
-        d->dest += to_copy;
-        d->curlen -= to_copy;
-        return TINF_OK;
-        #else
-        d->dest[0] = d->dest[d->lzOff];
-        d->dest++;
-        #endif
-    }
-    d->curlen--;
-    return TINF_OK;
+   return TINF_OK;
 }
 
 /* inflate next byte from uncompressed block of data */
@@ -546,18 +554,27 @@ void uzlib_init(void)
    length_bits[28] = 0;
    length_base[28] = 258;
 #endif
+
+    interp_config cfg = interp_default_config();
+    interp_config_set_shift(&cfg, 1);
+    interp_config_set_mask(&cfg, 0, 7);
+    interp_set_config(interp0, 0, &cfg);
+    cfg = interp_default_config();
+    interp_config_set_mask(&cfg, 0, 0);
+    interp_config_set_cross_input(&cfg, true);
+    interp_set_config(interp0, 1, &cfg);
+    interp0->base[0] = 0;
+    interp0->base[1] = 0;
 }
 
 /* initialize decompression structure */
-void uzlib_uncompress_init(TINF_DATA *d, void *dict, unsigned int dictLen)
+void uzlib_uncompress_init(TINF_DATA *d)
 {
    d->eof = 0;
    d->bitcount = 0;
+   interp0->accum[0] = 0;
    d->bfinal = 0;
    d->btype = -1;
-   d->dict_size = dictLen;
-   d->dict_ring = dict;
-   d->dict_idx = 0;
    d->curlen = 0;
 }
 

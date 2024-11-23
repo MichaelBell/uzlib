@@ -77,6 +77,7 @@ extern "C" {
 
 typedef struct {
    unsigned short table[16];  /* table of code length counts */
+   unsigned short offs[16];
    unsigned short trans[288]; /* code -> symbol translation table */
 } TINF_TREE;
 
@@ -102,6 +103,9 @@ struct uzlib_uncomp {
     /* Pointer past the end of the dest buffer, similar to source_limit */
     unsigned char *dest_limit;
 
+    unsigned char *dest_ring_start;
+    unsigned char *dest_ring_end;
+
     /* Accumulating checksum */
     unsigned int checksum;
     char checksum_type;
@@ -110,10 +114,7 @@ struct uzlib_uncomp {
     int btype;
     int bfinal;
     unsigned int curlen;
-    int lzOff;
-    unsigned char *dict_ring;
-    unsigned int dict_size;
-    unsigned int dict_idx;
+    unsigned char * lzPtr;
 
     TINF_TREE ltree; /* dynamic length/symbol tree */
     TINF_TREE dtree; /* dynamic distance tree */
@@ -124,7 +125,6 @@ struct uzlib_uncomp {
 #define TINF_PUT(d, c) \
     { \
         *d->dest++ = c; \
-        if (d->dict_ring) { d->dict_ring[d->dict_idx++] = c; if (d->dict_idx == d->dict_size) d->dict_idx = 0; } \
     }
 
 unsigned char TINFCC uzlib_get_byte(TINF_DATA *d);
@@ -132,7 +132,7 @@ unsigned char TINFCC uzlib_get_byte(TINF_DATA *d);
 /* Decompression API */
 
 void TINFCC uzlib_init(void);
-void TINFCC uzlib_uncompress_init(TINF_DATA *d, void *dict, unsigned int dictLen);
+void TINFCC uzlib_uncompress_init(TINF_DATA *d);
 int  TINFCC uzlib_uncompress(TINF_DATA *d);
 int  TINFCC uzlib_uncompress_chksum(TINF_DATA *d);
 
