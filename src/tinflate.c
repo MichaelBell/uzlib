@@ -258,12 +258,12 @@ static int tinf_getbit(TINF_DATA *d)
    if (!d->bitcount--)
    {
       /* load next tag */
-      interp0->accum[0] = uzlib_get_byte(d);
+      interp1->accum[0] = uzlib_get_byte(d);
       d->bitcount = 7;
    }
 
    /* shift bit out of tag */
-   bit = interp0->pop[1];
+   bit = interp1->pop[1];
 
    return bit;
 }
@@ -278,7 +278,7 @@ static unsigned int tinf_read_bits(TINF_DATA *d, int num, int base)
    {
       if (num > d->bitcount) {
          unsigned int shift = d->bitcount;
-         val = interp0->accum[0];
+         val = interp1->accum[0];
 
          while (shift + 8 <= num) {
             val |= uzlib_get_byte(d) << shift;
@@ -290,16 +290,16 @@ static unsigned int tinf_read_bits(TINF_DATA *d, int num, int base)
             unsigned int mask = (1 << num) - (1 << shift);
             val |= (next_byte << shift) & mask;
             d->bitcount = 8 - (num - shift);
-            interp0->accum[0] = next_byte >> (num - shift);
+            interp1->accum[0] = next_byte >> (num - shift);
          } else {
             d->bitcount = 0;
-            interp0->accum[0] = 0;
+            interp1->accum[0] = 0;
          }
       } else {
          unsigned int mask = (1 << num) - 1;
-         unsigned int tag = interp0->accum[0];
+         unsigned int tag = interp1->accum[0];
          val = tag & mask;
-         interp0->accum[0] = tag >> num;
+         interp1->accum[0] = tag >> num;
          d->bitcount -= num;
       }
    }
@@ -529,13 +529,23 @@ static int tinf_inflate_uncompressed_block(TINF_DATA *d)
         d->bitcount = 0;
     }
 
-    if (--d->curlen == 0) {
-        return TINF_DONE;
-    }
 
-    unsigned char c = uzlib_get_byte(d);
-    TINF_PUT(d, c);
-    return TINF_OK;
+   {
+      unsigned int to_copy = d->curlen, dest_len = d->dest_limit - d->dest;
+      if (to_copy > dest_len) {
+         to_copy = dest_len;
+      }
+      d->curlen -= to_copy;
+      while (to_copy--) {
+         *d->dest++ = uzlib_get_byte(d);
+      }
+   }
+
+   if (d->curlen == 0) {
+      return TINF_DONE;
+   }
+
+   return TINF_OK;
 }
 
 /* ---------------------- *
@@ -558,13 +568,13 @@ void uzlib_init(void)
     interp_config cfg = interp_default_config();
     interp_config_set_shift(&cfg, 1);
     interp_config_set_mask(&cfg, 0, 7);
-    interp_set_config(interp0, 0, &cfg);
+    interp_set_config(interp1, 0, &cfg);
     cfg = interp_default_config();
     interp_config_set_mask(&cfg, 0, 0);
     interp_config_set_cross_input(&cfg, true);
-    interp_set_config(interp0, 1, &cfg);
-    interp0->base[0] = 0;
-    interp0->base[1] = 0;
+    interp_set_config(interp1, 1, &cfg);
+    interp1->base[0] = 0;
+    interp1->base[1] = 0;
 }
 
 /* initialize decompression structure */
@@ -572,7 +582,7 @@ void uzlib_uncompress_init(TINF_DATA *d)
 {
    d->eof = 0;
    d->bitcount = 0;
-   interp0->accum[0] = 0;
+   interp1->accum[0] = 0;
    d->bfinal = 0;
    d->btype = -1;
    d->curlen = 0;
